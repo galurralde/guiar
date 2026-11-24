@@ -1,5 +1,19 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { calcularDistancia, calcularRumbo } from './utils/geo';
+import { createTrackPoint } from './domain/models';
+import {
+  clearTrailSession,
+  loadBasePoint,
+  loadBreadcrumbs,
+  saveBasePoint,
+  saveBreadcrumbs,
+} from './services/storage';
+import { applyGuiarTheme } from './services/theme';
+import {
+  extractCompassHeading,
+  shortestAngleDelta,
+  smoothCompassAngle,
+} from './services/sensors';
 
 function App() {
   const [puntoPartida, setPuntoPartida] = useState(null);
@@ -9,106 +23,122 @@ function App() {
   const [errorGps, setErrorGps] = useState(null);
   const [modoCamara, setModoCamara] = useState(false);
   const [migajas, setMigajas] = useState([]);
-  
-  const [calibrado, setCalibrado] = useState(false);
-  const [modoRetornoActivo, setModoRetornoActivo] = useState(false);
-  const [indicadorVertical, setIndicadorVertical] = useState("NIVELADO");
+  const [brujulaGrados, setBrujulaGrados] = useState(0);
 
-  // REF DE ORIENTACIÓN ULTRA ESTABLE
   const brujulaFiltrada = useRef(0);
-  const headingInteligente = useRef(0);
-
+  const betaFiltrado = useRef(0);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
-  const canvasRef = useRef(null);
 
   useEffect(() => {
-    const guardado = localStorage.getItem('puntoPartida');
-    if (guardado) { setPuntoPartida(JSON.parse(guardado)); setCalibrado(true); }
-    const migajasGuardadas = localStorage.getItem('migajas');
-    if (migajasGuardadas) setMigajas(JSON.parse(migajasGuardadas));
+    applyGuiarTheme();
+
+    const baseGuardada = loadBasePoint();
+    if (baseGuardada) {
+      setPuntoPartida(baseGuardada);
+    }
+
+    const migajasGuardadas = loadBreadcrumbs();
+    if (migajasGuardadas.length > 0) {
+      setMigajas(migajasGuardadas);
+    }
   }, []);
 
   const registrarPuntoPartida = () => {
-    if (!navigator.geolocation) { setErrorGps("Sin soporte GPS."); return; }
+    setErrorGps(null);
+    if (!navigator.geolocation) {
+      setErrorGps('Tu navegador no soporta GPS.');
+      return;
+    }
+
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        const coord = { 
-          lat: pos.coords.latitude, 
+        const coord = createTrackPoint({
+          lat: pos.coords.latitude,
           lon: pos.coords.longitude,
-          alt: pos.coords.altitude || 0 
-        };
+          alt: pos.coords.altitude,
+          accuracy: pos.coords.accuracy,
+          label: 'BASE',
+          timestamp: pos.timestamp || Date.now(),
+        });
         setPuntoPartida(coord);
         setMigajas([coord]);
-        setCalibrado(true);
-        localStorage.setItem('puntoPartida', JSON.stringify(coord));
-        localStorage.setItem('migajas', JSON.stringify([coord]));
+        saveBasePoint(coord);
+        saveBreadcrumbs([coord]);
+        alert('¡Base de retorno fijada!');
       },
-      (err) => setErrorGps("Error GPS: " + err.message),
-      { enableHighAccuracy: true }
+      (err) => setErrorGps('Error de GPS: ' + err.message),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
   };
 
   useEffect(() => {
     if (!puntoPartida) return;
+
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        const actual = { lat: pos.coords.latitude, lon: pos.coords.longitude, alt: pos.coords.altitude || 0 };
+        setErrorGps(null);
+        const actual = createTrackPoint({
+          lat: pos.coords.latitude,
+          lon: pos.coords.longitude,
+          alt: pos.coords.altitude,
+          accuracy: pos.coords.accuracy,
+          timestamp: pos.timestamp || Date.now(),
+        });
         setPosicionActual(actual);
+
         const dist = calcularDistancia(actual.lat, actual.lon, puntoPartida.lat, puntoPartida.lon);
         const rum = calcularRumbo(actual.lat, actual.lon, puntoPartida.lat, puntoPartida.lon);
+
         setDistancia(dist.toFixed(3));
         setRumbo(rum);
+
+        setMigajas((prevMigajas) => {
+          if (prevMigajas.length === 0) {
+            const inicial = [{ ...actual, label: 'BASE' }];
+            saveBreadcrumbs(inicial);
+            return inicial;
+          }
+
+          const ultimaMigaja = prevMigajas[prevMigajas.length - 1];
+          const distALastMigaja = calcularDistancia(
+            actual.lat,
+            actual.lon,
+            ultimaMigaja.lat,
+            ultimaMigaja.lon
+          );
+
+          if (distALastMigaja > 0.015) {
+            const nuevoHito = {
+              ...actual,
+              label: `PUNTO ${prevMigajas.length}`,
+            };
+            const nuevasMigajas = [...prevMigajas, nuevoHito];
+            saveBreadcrumbs(nuevasMigajas);
+            return nuevasMigajas;
+          }
+          return prevMigajas;
+        });
       },
-      (err) => setErrorGps("Error GPS: " + err.message),
-      { enableHighAccuracy: true }
+      (err) => setErrorGps('Error de GPS: ' + err.message),
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
+
     return () => navigator.geolocation.clearWatch(watchId);
   }, [puntoPartida]);
 
-  // BRÚJULA MATRICIAL ADAPTATIVA DE ALTA PRECISIÓN (VERSIÓN CORREGIDA)
   useEffect(() => {
     const manejarOrientacion = (event) => {
-      let alpha = event.alpha || 0;
-      let beta = event.beta || 0;
-      let gamma = event.gamma || 0;
-      let headingCalculado = event.webkitCompassHeading;
-
-      // Si el navegador no provee webkitCompassHeading de forma nativa (o estamos emulando/Android)
-      if (headingCalculado === undefined) {
-        // Convertimos los ángulos de Euler del sensor a radianes
-        const alphaRad = (alpha * Math.PI) / 180;
-        const betaRad = (beta * Math.PI) / 180;
-        const gammaRad = (gamma * Math.PI) / 180;
-
-        // Calculamos las componentes del vector unitario apuntando al horizonte del equipo
-        const cA = Math.cos(alphaRad), sA = Math.sin(alphaRad);
-        const cB = Math.cos(betaRad), sB = Math.sin(betaRad);
-        const cG = Math.cos(gammaRad), sG = Math.sin(gammaRad);
-
-        // Matriz de rotación simplificada para obtener el Heading real proyectado al suelo
-        const yH = -sA * cG - cA * sB * sG;
-        const xH = -cA * cG + sA * sB * sG;
-
-        let rumboRad = Math.atan2(yH, xH);
-        if (rumboRad < 0) rumboRad += 2 * Math.PI;
-        headingCalculado = (rumboRad * 180) / Math.PI;
+      const headingRaw = extractCompassHeading(event);
+      if (headingRaw !== null) {
+        const suavizada = smoothCompassAngle(brujulaFiltrada.current, headingRaw, 0.22);
+        brujulaFiltrada.current = suavizada;
+        setBrujulaGrados(suavizada);
       }
 
-      // CORRECCIÓN DINÁMICA POR INCLINACIÓN (Sostener acostado mirando al piso)
-      // Si el dispositivo está plano (cerca de la mesa o apuntando al piso, beta bajo o gamma alto),
-      // forzamos el recalculo basándonos en la orientación horizontal estricta.
-      if (Math.abs(beta) < 35 && Math.abs(gamma) > 45) {
-        headingCalculado = (headingCalculado + 90) % 360; // Compensación de desfase de agarre horizontal
+      if (typeof event.beta === 'number' && !Number.isNaN(event.beta)) {
+        betaFiltrado.current += (event.beta - betaFiltrado.current) * 0.15;
       }
-
-      // Filtro de paso bajo matemático para eliminar el temblor de la mano
-      let diff = headingCalculado - brujulaFiltrada.current;
-      if (diff > 180) diff -= 360;
-      if (diff < -180) diff += 360;
-      
-      brujulaFiltrada.current += diff * 0.22; // Nivel de respuesta rápido y suave
-      headingInteligente.current = (brujulaFiltrada.current + 360) % 360;
     };
 
     window.addEventListener('deviceorientation', manejarOrientacion, true);
@@ -119,65 +149,229 @@ function App() {
     async function activarCamara() {
       if (modoCamara) {
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { exact: "environment" } }, audio: false });
-          if (videoRef.current) { videoRef.current.srcObject = stream; streamRef.current = stream; }
-        } catch (e) { setModoCamara(false); }
-      } else {
-        if (streamRef.current) { streamRef.current.getTracks().forEach(t => t.stop()); streamRef.current = null; }
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { exact: 'environment' } },
+            audio: false,
+          });
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            streamRef.current = stream;
+          }
+        } catch {
+          try {
+            const fallback = await navigator.mediaDevices.getUserMedia({
+              video: true,
+              audio: false,
+            });
+            if (videoRef.current) {
+              videoRef.current.srcObject = fallback;
+              streamRef.current = fallback;
+            }
+          } catch {
+            setModoCamara(false);
+            setErrorGps('No se pudo iniciar la cámara; continuás en modo ahorro.');
+          }
+        }
+      } else if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
       }
     }
+
     activarCamara();
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+    };
   }, [modoCamara]);
 
-  // El rumbo HUD calcula el norte real o el desvío hacia tu base fijada
-  const agujaNorteYBase = headingInteligente.current;
+  const rotacionMiniBrujula = rumbo !== null ? shortestAngleDelta(rumbo, brujulaGrados) : 0;
+  const deltaAltitud =
+    posicionActual?.alt !== null &&
+    posicionActual?.alt !== undefined &&
+    puntoPartida?.alt !== null &&
+    puntoPartida?.alt !== undefined
+      ? (posicionActual.alt - puntoPartida.alt).toFixed(0)
+      : null;
 
   return (
-    <div style={{ padding: '20px', fontFamily: 'Arial, sans-serif', textAlign: 'center', backgroundColor: modoCamara ? 'transparent' : '#121212', color: '#e0e0e0', minHeight: '100vh', position: 'relative' }}>
-      
+    <div
+      style={{
+        padding: '20px',
+        fontFamily: 'Inter, system-ui, sans-serif',
+        textAlign: 'center',
+        backgroundColor: modoCamara ? 'transparent' : 'var(--guiar-dark, #0F171A)',
+        color: '#F6F8F7',
+        minHeight: '100vh',
+        position: 'relative',
+      }}
+    >
       {modoCamara && (
-        <video ref={videoRef} autoPlay playsInline style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', objectFit: 'cover', zIndex: -2 }} />
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          style={{
+            position: 'fixed',
+            top: 0,
+            left: 0,
+            width: '100vw',
+            height: '100vh',
+            objectFit: 'cover',
+            zIndex: -2,
+          }}
+        />
       )}
 
-      <h1 style={{ fontSize: '24px', color: '#4CAF50', margin: '5px 0', textShadow: '0 2px 4px black' }}>Retorno Cerro Seguro 🛰️</h1>
+      <h1
+        style={{
+          fontSize: '24px',
+          color: 'var(--guiar-accent, #8CE026)',
+          margin: '5px 0',
+          textShadow: modoCamara ? '0 2px 4px rgba(0,0,0,0.8)' : 'none',
+        }}
+      >
+        GuiAR · Retorno Seguro
+      </h1>
 
-      {!calibrado ? (
-        <div style={{ marginTop: '50px', backgroundColor: '#1E1E24', padding: '20px', borderRadius: '15px', border: '1px solid #333' }}>
-          <h3 style={{ color: '#FF9800' }}>🔄 Sincronización Inicial</h3>
-          <p style={{ fontSize: '14px', color: '#ccc' }}>Coloque el teléfono en la posición que usará para caminar (parado o apuntando al piso) y dibuje un <b>8 en el aire</b>.</p>
-          <button onClick={registrarPuntoPartida} style={{ padding: '16px 30px', fontSize: '16px', fontWeight: 'bold', backgroundColor: '#4CAF50', color: 'white', border: 'none', borderRadius: '30px', cursor: 'pointer', marginTop: '15px' }}>
-            🟢 Calibrar y Fijar Base
+      {errorGps && (
+        <div
+          style={{
+            backgroundColor: 'rgba(184, 50, 50, 0.2)',
+            border: '1px solid var(--guiar-danger, #B83232)',
+            color: '#FCA5A5',
+            padding: '8px 12px',
+            borderRadius: '12px',
+            fontSize: '12px',
+            maxWidth: '320px',
+            margin: '8px auto',
+          }}
+        >
+          {errorGps}
+        </div>
+      )}
+
+      {!puntoPartida ? (
+        <div style={{ marginTop: '64px' }}>
+          <button
+            onClick={registrarPuntoPartida}
+            style={{
+              padding: '16px 32px',
+              fontSize: '16px',
+              fontWeight: 'bold',
+              backgroundColor: 'var(--guiar-accent, #8CE026)',
+              color: 'var(--guiar-primary, #14362E)',
+              border: 'none',
+              borderRadius: '16px',
+              minHeight: '48px',
+              cursor: 'pointer',
+            }}
+          >
+            Fijar Punto de Partida
           </button>
         </div>
       ) : (
         <div>
-          <button onClick={() => { setModoCamara(!modoCamara); setModoRetornoActivo(false); }} style={{ padding: '12px 24px', margin: '10px', fontSize: '14px', fontWeight: 'bold', backgroundColor: modoCamara ? '#f44336' : '#2196F3', color: 'white', border: 'none', borderRadius: '25px', cursor: 'pointer', zIndex: 100 }}>
-            {modoCamara ? "🔋 Activar Modo Ahorro" : "📷 Vista Holográfica RA"}
+          <button
+            onClick={() => setModoCamara(!modoCamara)}
+            style={{
+              padding: '12px 24px',
+              margin: '10px',
+              fontSize: '14px',
+              fontWeight: 'bold',
+              backgroundColor: modoCamara
+                ? 'var(--guiar-danger, #B83232)'
+                : 'var(--guiar-primary, #14362E)',
+              color: '#FFFFFF',
+              border: '1px solid rgba(140, 224, 38, 0.35)',
+              borderRadius: '16px',
+              minHeight: '48px',
+              cursor: 'pointer',
+            }}
+          >
+            {modoCamara ? 'Modo Ahorro (Sin Cámara)' : 'Activar Cámara RA'}
           </button>
 
-          <div style={{ backgroundColor: 'rgba(20,20,20,0.85)', padding: '10px', borderRadius: '10px', maxWidth: '240px', margin: '10px auto', border: '1px solid #333' }}>
-            <span style={{ fontSize: '13px', color: '#00E5FF' }}>🧭 Dirección Norte HUD Activo</span>
-            <br />
-            <span style={{ fontSize: '11px', color: '#aaa' }}>Ángulo Actual: {agujaNorteYBase.toFixed(1)}°</span>
+          <div
+            style={{
+              backgroundColor: 'rgba(15, 23, 26, 0.88)',
+              padding: '12px',
+              borderRadius: '16px',
+              maxWidth: '280px',
+              margin: '12px auto',
+              border: '1px solid rgba(255, 255, 255, 0.12)',
+              fontVariantNumeric: 'tabular-nums',
+            }}
+          >
+            <div style={{ fontSize: '13px', color: '#E2E8F0' }}>
+              Rumbo actual: <b>{brujulaGrados.toFixed(0)}°</b>
+            </div>
+            <div style={{ fontSize: '12px', color: '#CBD5E1', marginTop: '4px' }}>
+              A la base: <b>{distancia ? `${distancia} km` : 'Calculando...'}</b>
+            </div>
+            <div style={{ fontSize: '12px', color: 'var(--guiar-accent, #8CE026)', marginTop: '4px' }}>
+              Hitos guardados: <b>{migajas.length}</b>
+              {deltaAltitud !== null ? ` · Desnivel: ${Number(deltaAltitud) >= 0 ? `+${deltaAltitud}` : deltaAltitud} m` : ''}
+            </div>
           </div>
 
-          {/* BRÚJULA HUD TÁCTICA PERSISTENTE (NUNCA SE APAGA, CORREGIDA CON BASE EN GOOGLE MAPS) */}
-          <div style={{ position: 'fixed', bottom: '40px', left: '50%', transform: 'translateX(-50%)', width: '90px', height: '90px', borderRadius: '50%', backgroundColor: 'rgba(15,15,18,0.92)', border: '3px solid #00E5FF', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 999, boxShadow: '0 4px 15px rgba(0,229,255,0.4)' }}>
-            <div style={{ position: 'absolute', top: '5px', fontSize: '11px', color: '#ff4444', fontWeight: 'bold' }}>N</div>
-            <div style={{ position: 'absolute', bottom: '5px', fontSize: '10px', color: '#fff', fontWeight: 'bold' }}>S</div>
-            
-            {/* Aguja Giroscópica Adaptativa */}
-            <svg style={{ width: '50px', height: '50px', transform: `rotate(${-agujaNorteYBase}deg)`, transition: 'transform 0.08s linear' }} viewBox="0 0 24 24">
-              {/* Flecha Norte (Roja) */}
-              <path d="M12 2L6 12h6z" fill="#ff4444"/>
-              {/* Flecha Sur (Blanca) */}
-              <path d="M12 22l6-10h-6z" fill="#ffffff"/>
+          <div
+            style={{
+              position: 'fixed',
+              bottom: '28px',
+              right: '28px',
+              width: '78px',
+              height: '78px',
+              borderRadius: '50%',
+              backgroundColor: 'rgba(15, 23, 26, 0.92)',
+              border: '2px solid var(--guiar-accent, #8CE026)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              zIndex: 20,
+            }}
+          >
+            <svg
+              style={{
+                width: '40px',
+                height: '40px',
+                transform: `rotate(${rotacionMiniBrujula}deg)`,
+                fill: 'var(--guiar-accent, #8CE026)',
+                transition: 'transform 0.1s linear',
+              }}
+              viewBox="0 0 24 24"
+            >
+              <path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z" />
             </svg>
           </div>
 
-          <br />
-          <button onClick={() => { if(confirm("¿Borrar travesía?")) { localStorage.clear(); setPuntoPartida(null); setMigajas([]); setCalibrado(false); } }} style={{ backgroundColor: 'rgba(0,0,0,0.6)', color: '#ff6b6b', border: '1px solid #ff6b6b', padding: '6px 12px', borderRadius: '15px', fontSize: '11px', marginTop: '120px' }}>
-            Reiniciar Sensores
+          <button
+            onClick={() => {
+              if (confirm('¿Borrar travesía actual?')) {
+                clearTrailSession();
+                setPuntoPartida(null);
+                setPosicionActual(null);
+                setDistancia(null);
+                setRumbo(null);
+                setMigajas([]);
+                setModoCamara(false);
+              }
+            }}
+            style={{
+              backgroundColor: 'rgba(15, 23, 26, 0.75)',
+              color: '#FCA5A5',
+              border: '1px solid var(--guiar-danger, #B83232)',
+              padding: '8px 14px',
+              borderRadius: '16px',
+              minHeight: '48px',
+              fontSize: '12px',
+              marginTop: '24px',
+              cursor: 'pointer',
+            }}
+          >
+            Reiniciar Travesía
           </button>
         </div>
       )}

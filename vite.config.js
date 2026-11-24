@@ -7,22 +7,24 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'masked-icon.svg'],
+      includeAssets: ['favicon.ico', 'favicon.svg', 'favicon-96x96.png', 'apple-touch-icon.png'],
       manifest: {
-        name: 'Rescate Cerro - Retorno Seguro',
-        short_name: 'RescateCerro',
-        description: 'App offline para calcular el retorno al punto de partida',
-        theme_color: '#242424',
+        name: 'GuiAR - Senderos del NOA',
+        short_name: 'GuiAR',
+        description: 'Navegación offline, retorno seguro y gestión territorial en el NOA',
+        theme_color: '#14362E',
+        background_color: '#0F171A',
         icons: [
           {
-            src: 'pwa-192x192.png',
+            src: 'web-app-manifest-192x192.png',
             sizes: '192x192',
             type: 'image/png'
           },
           {
-            src: 'pwa-512x512.png',
+            src: 'web-app-manifest-512x512.png',
             sizes: '512x512',
-            type: 'image/png'
+            type: 'image/png',
+            purpose: 'any maskable'
           }
         ]
       }
